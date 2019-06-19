@@ -55,10 +55,6 @@ objc_upper_segments = {
     "https": "HTTPS",
 }
 
-# Hack - providers indexing is by int, but I have not idea how to get the actual
-# provider object here.
-ProtoInfoProvider = 0
-
 def _capitalize(s):
     """Capitalize a string - only first letter
     Args:
@@ -268,7 +264,7 @@ def get_plugin_out_arg(ctx, outdir, plugin, plugin_outfiles):
 
     Args:
       ctx: the <ctx> object
-      output: the package output directory <string>
+      outdir: the package output directory <string>
       plugin: the <PluginInfo> object.
       plugin_outfiles: The <dict<string,<File>>.  For example, {closure: "library.js"}
 
@@ -281,14 +277,14 @@ def get_plugin_out_arg(ctx, outdir, plugin, plugin_outfiles):
         arg = plugin.outdir.replace("{name}", outdir)
     elif plugin.out:
         outfile = plugin_outfiles[plugin.name]
-
-        #arg = "%s" % (outdir)
-        #arg = "%s/%s" % (outdir, outfile.short_path)
         arg = outfile.path
 
     # Collate a list of options from the plugin itself PLUS options from the
     # global plugin_options list (if they exist)
-    options = getattr(plugin, "options", []) + ctx.attr.plugin_options
+    options = []
+    options += getattr(plugin, "options", [])
+    options += getattr(ctx.attr, "plugin_options", [])
+
     if options:
         arg = "%s:%s" % (",".join(_get_plugin_options(ctx, options)), arg)
     return "--%s_out=%s" % (plugin.name, arg)
@@ -344,7 +340,7 @@ def _apply_plugin_transitivity_rules(ctx, targets, plugin):
             fail("Unknown transitivity rule '%s'" % rule)
     return targets
 
-def _get_plugin_outputs(ctx, descriptor, outputs, src, proto, plugin):
+def get_plugin_outputs(ctx, descriptor, outputs, src, proto, plugin):
     """Get the predicted generated outputs for a given plugin
 
     Args:
@@ -366,32 +362,6 @@ def _get_plugin_outputs(ctx, descriptor, outputs, src, proto, plugin):
         outputs.append(ctx.actions.declare_file(filename, sibling = sibling))
     return outputs
 
-def get_plugin_runfiles(tool):
-    """Gather runfiles for a plugin.
-    """
-    files = []
-    if not tool:
-        return files
-
-    info = tool[DefaultInfo]
-    if not info:
-        return files
-
-    if info.files:
-        files += info.files.to_list()
-
-    if info.default_runfiles:
-        runfiles = info.default_runfiles
-        if runfiles.files:
-            files += runfiles.files.to_list()
-
-    if info.data_runfiles:
-        runfiles = info.data_runfiles
-        if runfiles.files:
-            files += runfiles.files.to_list()
-
-    return files
-
 def proto_compile_impl(ctx):
     ###
     ### Part 1: setup variables used in scope
@@ -402,9 +372,6 @@ def proto_compile_impl(ctx):
 
     # <File> the protoc tool
     protoc = ctx.executable.protoc
-
-    # <bool> if this is a gRPC compilation
-    has_services = ctx.attr.has_services
 
     # <File> for the output descriptor.  Often used as the sibling in
     # 'declare_file' actions.
@@ -455,6 +422,9 @@ def proto_compile_impl(ctx):
     # single binaries.
     data = []
 
+    # Enviourment variables for protoc execution.
+    env = {}
+
     ###
     ### Part 2: gather plugin.out artifacts
     ###
@@ -470,7 +440,7 @@ def proto_compile_impl(ctx):
     for plugin in plugins:
         if plugin.executable:
             plugin_tools[plugin.name] = plugin.executable
-        data += plugin.data + get_plugin_runfiles(plugin.tool)
+        data += plugin.data
 
         filename = _get_plugin_out(ctx, plugin)
         if not filename:
@@ -513,7 +483,7 @@ def proto_compile_impl(ctx):
                 targets[src] = proto
 
     ###
-    ### Part 3cb: apply transitivity rules
+    ### Part 3b: apply transitivity rules
     ###
 
     # If the 'transitive = true' was enabled, we collected all the protos into
@@ -529,7 +499,7 @@ def proto_compile_impl(ctx):
     ###
     for src, proto in targets.items():
         for plugin in plugins:
-            outputs = _get_plugin_outputs(ctx, descriptor, outputs, src, proto, plugin)
+            outputs = get_plugin_outputs(ctx, descriptor, outputs, src, proto, plugin)
 
     ###
     ### Part 4: build list of arguments for protoc
@@ -560,25 +530,29 @@ def proto_compile_impl(ctx):
 
     mnemonic = "ProtoCompile"
 
-    command = " ".join([protoc.path] + args)
-
     if verbose > 0:
-        print("%s: %s" % (mnemonic, command))
+        print("%s: %s %s" % (mnemonic, protoc, " ".join(args)))
     if verbose > 1:
-        command += " && echo '\n##### SANDBOX AFTER RUNNING PROTOC' && find ."
-    if verbose > 2:
-        command = "echo '\n##### SANDBOX BEFORE RUNNING PROTOC' && find . && " + command
+        # Replace the protoc binary with the wrapper, so
+        # it'll print debug info according to
+        # the `verbose` env variable.
+        protoc = ctx.executable._protoc_debug_wrapper
+        env["verbose"] = str(verbose)
     if verbose > 3:
-        command = "env && " + command
         for f in outputs:
             print("expected output: %q", f.path)
 
-    ctx.actions.run_shell(
+    resolved_inputs, input_manifests = ctx.resolve_tools(tools=[plugin.tool for plugin in plugins if plugin.tool])
+
+    ctx.actions.run(
+        executable=protoc,
+        arguments = args,
         mnemonic = mnemonic,
-        command = command,
-        inputs = protos + data,
+        inputs = protos + data + resolved_inputs.to_list(),
         outputs = outputs + [descriptor] + ctx.outputs.outputs,
         tools = [protoc] + plugin_tools.values(),
+        input_manifests = input_manifests,
+        env = env,
     )
 
     ###
@@ -630,9 +604,6 @@ proto_compile = rule(
         "outputs": attr.output_list(
             doc = "Escape mechanism to explicitly declare files that will be generated",
         ),
-        "has_services": attr.bool(
-            doc = "If the proto files(s) have a service rpc, generate grpc outputs",
-        ),
         "protoc": attr.label(
             doc = "The protoc tool",
             default = "@com_google_protobuf//:protoc",
@@ -656,7 +627,13 @@ proto_compile = rule(
         "transitivity": attr.string_dict(
             doc = "Transitive rules.  When the 'transitive' property is enabled, this string_dict can be used to exclude protos from the compilation list",
         ),
+        "_protoc_debug_wrapper": attr.label(
+            default = "//protobuf:protoc_debug_wrapper",
+            cfg = "host",
+            executable = True,
+        ),
     },
+    # TODO(pcj) remove this
     outputs = {
         "descriptor": "%{name}/descriptor.source.bin",
     },
@@ -681,7 +658,6 @@ def invoke_transitive(proto_compile_rule, name_suffix, kwargs):
     """
 
     deps = kwargs.get("deps")
-    has_services = kwargs.get("has_services")
     include_imports = kwargs.get("include_imports")
     include_source_info = kwargs.get("include_source_info")
     name = kwargs.get("name")
@@ -698,7 +674,6 @@ def invoke_transitive(proto_compile_rule, name_suffix, kwargs):
     proto_compile_rule(
         name = rule_name,
         deps = deps,
-        has_services = has_services,
         include_imports = include_imports,
         include_source_info = include_source_info,
         outputs = outputs,
